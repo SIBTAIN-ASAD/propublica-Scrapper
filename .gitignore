@@ -1,0 +1,4 @@
+/propublica_output
+/env
+*.xlsx
+.DS_Store
