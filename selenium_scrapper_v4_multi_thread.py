@@ -8,8 +8,11 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from selenium import webdriver
+from selenium.webdriver import ActionChains
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -22,67 +25,19 @@ DB_PATH = OUT_DIR / "propublica_scrape.sqlite"
 CHECKPOINT_PATH = OUT_DIR / "checkpoint.json"
 
 REVENUE_FILTER = "5000000"
-WORKERS = 4  # Start with 8-12. Increase slowly.
+
+WORKERS = 12
 DELAY = 0.5
 PAGE_DELAY = 1
+RESTART_DRIVER_AFTER = 100
 
 STATES = [
-    "CA",
-    "NY",
-    "TX",
-    "FL",
-    "PA",
-    "IL",
-    "OH",
-    "MA",
-    "VA",
-    "NC",
-    "MI",
-    "NJ",
-    "WA",
-    "CO",
-    "DC",
-    "MN",
-    "GA",
-    "MD",
-    "WI",
-    "IN",
-    "MO",
-    "TN",
-    "OR",
-    "CT",
-    "AZ",
-    "SC",
-    "IA",
-    "LA",
-    "AL",
-    "KY",
-    "OK",
-    "DE",
-    "KS",
-    "UT",
-    "NE",
-    "NV",
-    "NM",
-    "AR",
-    "MS",
-    "ME",
-    "WV",
-    "HI",
-    "MT",
-    "VT",
-    "NH",
-    "RI",
-    "ID",
-    "AK",
-    "SD",
-    "ND",
-    "WY",
-    "PR",
-    "VI",
-    "GU",
-    "MP",
-    "PW",
+    "CA", "NY", "TX", "FL", "PA", "IL", "OH", "MA", "VA", "NC",
+    "MI", "NJ", "WA", "CO", "DC", "MN", "GA", "MD", "WI", "IN",
+    "MO", "TN", "OR", "CT", "AZ", "SC", "IA", "LA", "AL", "KY",
+    "OK", "DE", "KS", "UT", "NE", "NV", "NM", "AR", "MS", "ME",
+    "WV", "HI", "MT", "VT", "NH", "RI", "ID", "AK", "SD", "ND",
+    "WY", "PR", "VI", "GU", "MP", "PW"
 ]
 
 db_lock = threading.Lock()
@@ -109,24 +64,67 @@ def build_search_url(state, page):
 
 def setup_driver(worker_id):
     options = Options()
+    options.page_load_strategy = "eager"
+
     options.add_argument("--headless=new")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1600,1200")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--blink-settings=imagesEnabled=false")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-sync")
+    options.add_argument("--disable-default-apps")
+    options.add_argument("--log-level=3")
     options.add_argument(f"--user-data-dir=/tmp/propublica_chrome_worker_{worker_id}")
 
     driver = webdriver.Chrome(options=options)
-    driver.set_page_load_timeout(60)
+    driver.set_page_load_timeout(35)
+    driver.set_script_timeout(20)
     return driver
+
+
+def safe_get(driver, url, worker_id="", retries=3):
+    for attempt in range(1, retries + 1):
+        try:
+            driver.get(url)
+            return True
+
+        except TimeoutException as e:
+            log(f"[W{worker_id}] TIMEOUT {attempt}/{retries}: {url}")
+
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+
+            try:
+                ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            except Exception:
+                pass
+
+            time.sleep(2)
+
+            if attempt == retries:
+                raise e
+
+        except WebDriverException as e:
+            log(f"[W{worker_id}] WEBDRIVER ERROR {attempt}/{retries}: {url} -> {e}")
+            time.sleep(3)
+
+            if attempt == retries:
+                raise e
+
+    return False
 
 
 def init_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 
-    conn.execute(
-        """
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS results (
             org_url TEXT PRIMARY KEY,
             state TEXT,
@@ -142,8 +140,7 @@ def init_db():
             error TEXT,
             scraped_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
-    """
-    )
+    """)
 
     conn.commit()
     return conn
@@ -158,36 +155,46 @@ def already_scraped(conn, org_url):
 
 def save_row(conn, row):
     with db_lock:
-        conn.execute(
-            """
+        conn.execute("""
             INSERT OR REPLACE INTO results (
-                org_url, state, page, org_name, address, employer_id,
-                phone, email, org_website, filing_url, irs990_url, error
+                org_url,
+                state,
+                page,
+                org_name,
+                address,
+                employer_id,
+                phone,
+                email,
+                org_website,
+                filing_url,
+                irs990_url,
+                error
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                row["Org URL"],
-                row["State"],
-                row["Page"],
-                row["Org Name"],
-                row["Address"],
-                row["Employer ID"],
-                row["Phone"],
-                row["Email"],
-                row["Org Website"],
-                row["Filing URL"],
-                row["IRS990 URL"],
-                row["Error"],
-            ),
-        )
+        """, (
+            row["Org URL"],
+            row["State"],
+            row["Page"],
+            row["Org Name"],
+            row["Address"],
+            row["Employer ID"],
+            row["Phone"],
+            row["Email"],
+            row["Org Website"],
+            row["Filing URL"],
+            row["IRS990 URL"],
+            row["Error"],
+        ))
+
         conn.commit()
 
 
 def save_checkpoint(state, page):
-    CHECKPOINT_PATH.write_text(
-        json.dumps({"state": state, "page": page}, indent=2), encoding="utf-8"
-    )
+    with db_lock:
+        CHECKPOINT_PATH.write_text(
+            json.dumps({"state": state, "page": page}, indent=2),
+            encoding="utf-8"
+        )
 
 
 def load_checkpoint():
@@ -199,8 +206,11 @@ def load_checkpoint():
 def get_org_links(driver, state, page):
     url = build_search_url(state, page)
 
-    log(f"[LIST PAGE] State={state} Page={page}")
-    driver.get(url)
+    log(f"\n[LIST PAGE] State={state} Page={page}")
+    log(f"[URL] {url}")
+
+    safe_get(driver, url, "producer")
+
     time.sleep(2)
 
     links = [
@@ -253,14 +263,16 @@ def scrape_org(driver, wait, org_url, state, page, worker_id):
     try:
         log(f"[W{worker_id}] ORG {org_url}")
 
-        driver.get(org_url)
+        safe_get(driver, org_url, worker_id)
 
-        btn = wait.until(EC.presence_of_element_located((By.LINK_TEXT, "View Filing")))
+        btn = wait.until(
+            EC.presence_of_element_located((By.LINK_TEXT, "View Filing"))
+        )
 
         filing_url = btn.get_attribute("href")
         row["Filing URL"] = filing_url
 
-        driver.get(filing_url)
+        safe_get(driver, filing_url, worker_id)
 
         iframe = wait.until(
             EC.presence_of_element_located(
@@ -272,51 +284,53 @@ def scrape_org(driver, wait, org_url, state, page, worker_id):
 
         driver.switch_to.frame(iframe)
 
-        body = wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        body = wait.until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
 
         text = body.text
         driver.switch_to.default_content()
 
         lines = [x.strip() for x in text.splitlines() if x.strip()]
 
-        row["Org Name"] = find_after(
-            lines,
-            [
-                "Name of organization",
-                "BusinessNameLine1Txt",
-            ],
-        )
+        row["Org Name"] = find_after(lines, [
+            "Name of organization",
+            "BusinessNameLine1Txt",
+        ])
 
-        row["Employer ID"] = find_after(
-            lines,
-            [
-                "Employer identification number",
-                "EIN",
-            ],
-        )
+        row["Employer ID"] = find_after(lines, [
+            "Employer identification number",
+            "EIN",
+        ])
 
-        row["Phone"] = find_after(
-            lines,
-            [
-                "Telephone number",
-                "PhoneNum",
-            ],
-        )
+        row["Phone"] = find_after(lines, [
+            "Telephone number",
+            "PhoneNum",
+        ])
 
         row["Email"] = extract_email(text)
 
-        row["Org Website"] = find_after(
-            lines,
-            [
-                "Website",
-                "WebsiteAddressTxt",
-            ],
-        ) or extract_website(text)
+        row["Org Website"] = find_after(lines, [
+            "Website",
+            "WebsiteAddressTxt",
+        ]) or extract_website(text)
 
-        address_1 = find_after(lines, ["Number and street", "AddressLine1Txt"])
-        city = find_after(lines, ["City or town", "CityNm"])
-        state_code = find_after(lines, ["State", "StateAbbreviationCd"])
-        zip_code = find_after(lines, ["ZIP code", "ZIPCd"])
+        address_1 = find_after(lines, [
+            "Number and street",
+            "AddressLine1Txt",
+        ])
+        city = find_after(lines, [
+            "City or town",
+            "CityNm",
+        ])
+        state_code = find_after(lines, [
+            "State",
+            "StateAbbreviationCd",
+        ])
+        zip_code = find_after(lines, [
+            "ZIP code",
+            "ZIPCd",
+        ])
 
         row["Address"] = ", ".join(
             x for x in [address_1, city, state_code, zip_code] if x
@@ -336,9 +350,27 @@ def scrape_org(driver, wait, org_url, state, page, worker_id):
     return row
 
 
+def make_error_row(state, page, org_url, error):
+    return {
+        "State": state,
+        "Page": page,
+        "Org Name": "",
+        "Address": "",
+        "Employer ID": "",
+        "Phone": "",
+        "Email": "",
+        "Org Website": "",
+        "Org URL": org_url,
+        "Filing URL": "",
+        "IRS990 URL": "",
+        "Error": str(error),
+    }
+
+
 def worker(worker_id, conn):
     driver = setup_driver(worker_id)
     wait = WebDriverWait(driver, 25)
+    processed = 0
 
     while True:
         item = task_queue.get()
@@ -357,12 +389,46 @@ def worker(worker_id, conn):
                 save_row(conn, row)
                 log(f"[W{worker_id}] SAVED {org_url}")
 
+            processed += 1
+
+            if processed % RESTART_DRIVER_AFTER == 0:
+                log(f"[W{worker_id}] Restarting Chrome after {processed} orgs")
+
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+                driver = setup_driver(worker_id)
+                wait = WebDriverWait(driver, 25)
+
             time.sleep(DELAY)
+
+        except WebDriverException as e:
+            log(f"[W{worker_id}] DRIVER CRASH. Restarting Chrome. Error: {e}")
+
+            save_row(conn, make_error_row(state, page, org_url, e))
+
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+            driver = setup_driver(worker_id)
+            wait = WebDriverWait(driver, 25)
+
+        except Exception as e:
+            log(f"[W{worker_id}] UNEXPECTED ERROR {org_url}: {e}")
+            save_row(conn, make_error_row(state, page, org_url, e))
 
         finally:
             task_queue.task_done()
 
-    driver.quit()
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
     log(f"[W{worker_id}] stopped")
 
 
@@ -373,7 +439,6 @@ def producer(conn, resume=False):
     start_page = checkpoint["page"] if checkpoint else 1
 
     should_start = not resume
-
     list_driver = setup_driver("producer")
 
     try:
@@ -391,19 +456,35 @@ def producer(conn, resume=False):
             while True:
                 save_checkpoint(state, page)
 
-                links = get_org_links(list_driver, state, page)
+                try:
+                    links = get_org_links(list_driver, state, page)
+
+                except WebDriverException as e:
+                    log(f"[PRODUCER DRIVER ERROR] Restarting producer Chrome: {e}")
+
+                    try:
+                        list_driver.quit()
+                    except Exception:
+                        pass
+
+                    list_driver = setup_driver("producer")
+                    time.sleep(3)
+                    continue
 
                 if not links:
                     log(f"[STATE DONE] {state} ended at page {page}")
                     break
 
+                added = 0
+
                 for org_url in links:
                     if not already_scraped(conn, org_url):
                         task_queue.put((state, page, org_url))
+                        added += 1
                     else:
                         log(f"[PRODUCER SKIP] Already scraped {org_url}")
 
-                log(f"[QUEUE] Current pending tasks: {task_queue.qsize()}")
+                log(f"[QUEUE] Added={added} Pending={task_queue.qsize()}")
 
                 page += 1
                 time.sleep(PAGE_DELAY)
@@ -412,7 +493,10 @@ def producer(conn, resume=False):
             log(f"========== PRODUCER END STATE {state} ==========")
 
     finally:
-        list_driver.quit()
+        try:
+            list_driver.quit()
+        except Exception:
+            pass
 
 
 def main():
@@ -424,26 +508,36 @@ def main():
     threads = []
 
     log(f"[START] Workers={WORKERS}")
+    log(f"[DB] {DB_PATH}")
 
     for i in range(WORKERS):
-        t = threading.Thread(target=worker, args=(i + 1, conn), daemon=True)
+        t = threading.Thread(
+            target=worker,
+            args=(i + 1, conn),
+            daemon=True
+        )
         t.start()
         threads.append(t)
 
-    producer(conn, resume=resume)
+    try:
+        producer(conn, resume=resume)
 
-    log("[PRODUCER DONE] Waiting for worker queue to finish...")
-    task_queue.join()
+        log("[PRODUCER DONE] Waiting for worker queue to finish...")
+        task_queue.join()
 
-    for _ in threads:
-        task_queue.put(None)
+    except KeyboardInterrupt:
+        log("[STOP] KeyboardInterrupt received. Waiting for current tasks to stop.")
 
-    for t in threads:
-        t.join()
+    finally:
+        for _ in threads:
+            task_queue.put(None)
 
-    conn.close()
+        for t in threads:
+            t.join()
 
-    log("[DONE] Scraping finished.")
+        conn.close()
+
+        log("[DONE] Scraping finished or safely stopped.")
 
 
 if __name__ == "__main__":
