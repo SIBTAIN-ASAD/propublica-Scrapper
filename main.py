@@ -11,6 +11,7 @@ import random
 import requests
 import urllib3
 from bs4 import BeautifulSoup
+from requests.exceptions import ChunkedEncodingError, ContentDecodingError
 
 
 BASE = "https://projects.propublica.org"
@@ -69,7 +70,7 @@ session.headers.update({
         "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "Referer": "https://projects.propublica.org/nonprofits/",
@@ -128,9 +129,55 @@ def fetch_list_page(url, use_oxylabs=False):
     return response, via
 
 
+FORM_TYPES = ("IRS990", "IRS990PF", "IRS990EZ")
+WARNING_PREFIX = "WARNING:"
+
+
+def form_type_from_url(url):
+    for form in FORM_TYPES:
+        if url.rstrip("/").endswith("/" + form):
+            return form
+    return url.rstrip("/").split("/")[-1]
+
+
+def is_warning_error(error):
+    return bool(error and error.startswith(WARNING_PREFIX))
+
+
+def is_garbled_response(text):
+    if not text:
+        return True
+
+    sample = text[:3000]
+    lower = sample.lower()
+    if any(
+        marker in lower
+        for marker in ("<html", "<!doctype", "nonprofit", "businessnamelinetxt")
+    ):
+        return False
+
+    non_text = sum(1 for ch in sample if ord(ch) < 32 and ch not in "\r\n\t")
+    return non_text > max(20, len(sample) * 0.08)
+
+
+def read_response_text(response):
+    try:
+        text = response.text
+    except (ContentDecodingError, ChunkedEncodingError, UnicodeDecodeError) as e:
+        raise ValueError(f"Response decode failed: {e}") from e
+
+    if is_garbled_response(text):
+        raise ValueError("Garbled/binary response body")
+
+    return text
+
+
 def fetch_with_fallback(url, timeout=REQUEST_TIMEOUT, label="", validate=None):
     response = direct_get(url, timeout)
     via = "direct"
+
+    if response.status_code == 404:
+        return response, via
 
     if response.status_code in (429, 403, 500, 502, 503, 504):
         log(f"[FETCH] {label} HTTP {response.status_code} via direct, retrying Oxylabs")
@@ -138,9 +185,16 @@ def fetch_with_fallback(url, timeout=REQUEST_TIMEOUT, label="", validate=None):
         return response, "Oxylabs"
 
     if response.status_code == 200:
-        incomplete = validate(response.text) if validate else len(response.text) < 15000
+        try:
+            text = read_response_text(response)
+        except ValueError as e:
+            log(f"[FETCH] {label} {e}, retrying Oxylabs")
+            response = oxylabs_get(url, timeout)
+            return response, "Oxylabs"
+
+        incomplete = validate(text) if validate else len(text) < 15000
         if incomplete:
-            reason = "incomplete content" if validate else f"blocked response ({len(response.text)} bytes)"
+            reason = "incomplete content" if validate else f"blocked response ({len(text)} bytes)"
             log(f"[FETCH] {label} {reason}, retrying Oxylabs")
             response = oxylabs_get(url, timeout)
             via = "Oxylabs"
@@ -166,15 +220,46 @@ def get_view_filing_url(html):
 
 
 def has_filing_content(html, filing_url):
-    return get_irs990_url(html, filing_url) is not None
+    return bool(get_filing_form_urls(html, filing_url))
 
 
 def has_irs990_content(html):
     return (
         "BusinessNameLine1Txt" in html
         or "Name of organization" in html
+        or "Name of foundation" in html
         or "Employer identification number" in html
     )
+
+
+def get_filing_form_urls(html, filing_url):
+    urls = []
+    seen = set()
+
+    soup = BeautifulSoup(html, "html.parser")
+    for iframe in soup.select("#forms-area iframe[src], #forms-area-border iframe[src]"):
+        src = (iframe.get("src") or "").strip()
+        if not src or "full_text" not in src:
+            continue
+        url = urljoin(BASE, src)
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+
+    match = re.search(r"/organizations/\d+/(\d+)/full", filing_url)
+    if match:
+        filing_id = match.group(1)
+        for form in FORM_TYPES:
+            url = f"{BASE}/nonprofits/full_text/{filing_id}/{form}"
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+
+    return sorted(urls, key=lambda url: (
+        FORM_TYPES.index(form_type_from_url(url))
+        if form_type_from_url(url) in FORM_TYPES
+        else len(FORM_TYPES)
+    ))
 
 
 def get_irs990_url(html, filing_url):
@@ -244,7 +329,15 @@ def already_scraped(conn, org_url):
     with db_lock:
         cur = conn.cursor()
         cur.execute(
-            "SELECT 1 FROM results WHERE org_url = ? AND (error IS NULL OR error = '')",
+            """
+            SELECT 1 FROM results
+            WHERE org_url = ?
+              AND (
+                error IS NULL
+                OR error = ''
+                OR error LIKE 'WARNING:%'
+              )
+            """,
             (org_url,),
         )
         return cur.fetchone() is not None
@@ -295,11 +388,16 @@ def get_db_stats(conn):
             "SELECT COUNT(*) FROM results WHERE error IS NULL OR error = ''"
         )
         ok_count = cur.fetchone()[0]
+        cur.execute(
+            "SELECT COUNT(*) FROM results WHERE error LIKE 'WARNING:%'"
+        )
+        warned_count = cur.fetchone()[0]
 
     return {
         "total": total,
         "ok": ok_count,
-        "errored": total - ok_count,
+        "warned": warned_count,
+        "errored": total - ok_count - warned_count,
     }
 
 
@@ -309,7 +407,21 @@ def get_errored_rows(conn):
         cur.execute("""
             SELECT org_url, state, page, error
             FROM results
-            WHERE error IS NOT NULL AND error != ''
+            WHERE error IS NOT NULL
+              AND error != ''
+              AND error NOT LIKE 'WARNING:%'
+            ORDER BY state, page, org_url
+        """)
+        return cur.fetchall()
+
+
+def get_warned_rows(conn):
+    with db_lock:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT org_url, state, page, error
+            FROM results
+            WHERE error LIKE 'WARNING:%'
             ORDER BY state, page, org_url
         """)
         return cur.fetchall()
@@ -322,6 +434,7 @@ def print_db_stats(conn):
     log("\n=== Database Stats ===")
     log(f"Total rows:    {stats['total']}")
     log(f"Successful:    {stats['ok']}")
+    log(f"Warnings:      {stats['warned']}")
     log(f"Errored:       {stats['errored']}")
 
     if checkpoint:
@@ -340,6 +453,14 @@ def print_db_stats(conn):
         if stats["errored"] > 5:
             log(f"  ... and {stats['errored'] - 5} more")
 
+    if stats["warned"]:
+        log("\nRecent warnings:")
+        for org_url, state, page, error in get_warned_rows(conn)[:5]:
+            preview = (error or "")[:100]
+            log(f"  - {org_url} [{state} p{page}]: {preview}")
+        if stats["warned"] > 5:
+            log(f"  ... and {stats['warned'] - 5} more")
+
 
 def show_start_menu(conn):
     stats = get_db_stats(conn)
@@ -349,7 +470,7 @@ def show_start_menu(conn):
     print(f"Database: {DB_PATH}")
     print(
         f"Rows: {stats['total']} total | "
-        f"{stats['ok']} ok | {stats['errored']} errored"
+        f"{stats['ok']} ok | {stats['warned']} warned | {stats['errored']} errored"
     )
     if checkpoint:
         print(
@@ -359,16 +480,17 @@ def show_start_menu(conn):
     print()
     print("1. Fresh start (scrape from beginning)")
     print("2. Resume from checkpoint")
-    print("3. Retry all errored rows in database")
-    print("4. Show database stats")
-    print("5. Exit")
+    print("3. Retry errored rows only")
+    print("4. Retry warning rows only")
+    print("5. Show database stats")
+    print("6. Exit")
     print()
 
     while True:
-        choice = input("Select option [1-5]: ").strip()
-        if choice in {"1", "2", "3", "4", "5"}:
+        choice = input("Select option [1-6]: ").strip()
+        if choice in {"1", "2", "3", "4", "5", "6"}:
             return choice
-        print("Invalid choice. Enter 1, 2, 3, 4, or 5.")
+        print("Invalid choice. Enter 1, 2, 3, 4, 5, or 6.")
 
 
 def save_checkpoint(state, page):
@@ -480,7 +602,15 @@ def get_org_links(state, page):
 
             response.raise_for_status()
 
-            links, has_search_structure = parse_list_html(response.text)
+            try:
+                list_html = read_response_text(response)
+            except ValueError as e:
+                last_error = str(e)
+                log(f"[LIST GARBLED] State={state} Page={page}: {last_error}")
+                time.sleep(20 * attempt)
+                continue
+
+            links, has_search_structure = parse_list_html(list_html)
 
             if links:
                 log(f"[LIST FOUND] State={state} Page={page} Firms={len(links)}")
@@ -508,7 +638,11 @@ def get_org_links(state, page):
 
                 if response.status_code == 200:
                     response.raise_for_status()
-                    links, has_search_structure = parse_list_html(response.text)
+                    try:
+                        list_html = read_response_text(response)
+                    except ValueError:
+                        list_html = ""
+                    links, has_search_structure = parse_list_html(list_html)
 
                     if links:
                         log(f"[LIST FOUND] State={state} Page={page} Firms={len(links)}")
@@ -542,7 +676,11 @@ def get_org_links(state, page):
 
                 if response.status_code == 200:
                     response.raise_for_status()
-                    links, has_search_structure = parse_list_html(response.text)
+                    try:
+                        list_html = read_response_text(response)
+                    except ValueError:
+                        list_html = ""
+                    links, has_search_structure = parse_list_html(list_html)
 
                     if links:
                         log(f"[LIST FOUND] State={state} Page={page} Firms={len(links)}")
@@ -589,6 +727,7 @@ def fill_row_from_irs990_text(row, text):
 
     row["Org Name"] = find_after(lines, [
         "Name of organization",
+        "Name of foundation",
         "BusinessNameLine1Txt",
     ])
 
@@ -660,8 +799,9 @@ def scrape_org(org_url, state, page, worker_id):
             f"bytes={len(response.text)} via={via}"
         )
         response.raise_for_status()
+        org_html = read_response_text(response)
 
-        filing_url = get_view_filing_url(response.text)
+        filing_url = get_view_filing_url(org_html)
         if not filing_url:
             raise Exception("View Filing link not found")
         row["Filing URL"] = filing_url
@@ -673,33 +813,82 @@ def scrape_org(org_url, state, page, worker_id):
         )
         log(
             f"[W{worker_id}] Filing page status={response.status_code} "
-            f"bytes={len(response.text)} via={via}"
+            f"bytes={len(response.content)} via={via}"
         )
         response.raise_for_status()
+        filing_html = read_response_text(response)
+        primary_irs990_url = get_irs990_url(filing_html, filing_url)
 
-        irs990_url = get_irs990_url(response.text, filing_url)
-        if not irs990_url:
-            raise Exception("IRS990 URL not found on filing page")
-        row["IRS990 URL"] = irs990_url
+        form_urls = []
+        if primary_irs990_url:
+            form_urls.append(primary_irs990_url)
+        for url in get_filing_form_urls(filing_html, filing_url):
+            if url not in form_urls:
+                form_urls.append(url)
 
-        response, via = fetch_with_fallback(
-            irs990_url,
-            label=f"W{worker_id} IRS990",
-            validate=lambda html: not has_irs990_content(html),
-        )
-        log(
-            f"[W{worker_id}] IRS990 status={response.status_code} "
-            f"bytes={len(response.text)} via={via}"
-        )
-        response.raise_for_status()
+        if not form_urls:
+            raise Exception("No tax form URLs found on filing page")
 
-        text = BeautifulSoup(response.text, "html.parser").get_text("\n", strip=True)
-        if not text:
-            raise Exception("Empty IRS990 content")
+        text = None
+        used_url = None
+        warning = ""
 
+        for form_url in form_urls:
+            form_name = form_type_from_url(form_url)
+            form_response, via = fetch_with_fallback(
+                form_url,
+                label=f"W{worker_id} {form_name}",
+                validate=lambda html: not has_irs990_content(html),
+            )
+            log(
+                f"[W{worker_id}] Form {form_name} status={form_response.status_code} "
+                f"bytes={len(form_response.text)} via={via}"
+            )
+
+            if form_response.status_code == 404:
+                log(f"[W{worker_id}] Form 404, trying next: {form_url}")
+                continue
+
+            if form_response.status_code != 200:
+                continue
+
+            try:
+                form_html = read_response_text(form_response)
+            except ValueError:
+                log(f"[W{worker_id}] Form garbled, trying next: {form_url}")
+                continue
+
+            if not has_irs990_content(form_html):
+                continue
+
+            text = BeautifulSoup(form_html, "html.parser").get_text(
+                "\n", strip=True
+            )
+            if not text:
+                continue
+
+            used_url = form_url
+            if form_url != primary_irs990_url:
+                warning = (
+                    f"{WARNING_PREFIX} primary IRS990 unavailable; "
+                    f"used {form_name} from filing page"
+                )
+            break
+
+        if not text or not used_url:
+            raise Exception("No usable tax form found on filing page")
+
+        row["IRS990 URL"] = used_url
         fill_row_from_irs990_text(row, text)
 
-        log(f"[W{worker_id}] OK {row['Org Name']} | EIN={row['Employer ID']}")
+        if warning:
+            row["Error"] = warning
+            log(
+                f"[W{worker_id}] OK (warning) {row['Org Name']} | "
+                f"EIN={row['Employer ID']} | {warning}"
+            )
+        else:
+            log(f"[W{worker_id}] OK {row['Org Name']} | EIN={row['Employer ID']}")
 
     except Exception as e:
         row["Error"] = str(e)
@@ -744,7 +933,9 @@ def worker(worker_id, conn):
                 log(f"[W{worker_id}] RETRY {org_url}")
                 row = scrape_org(org_url, state, page, worker_id)
                 save_row(conn, row)
-                if row["Error"]:
+                if is_warning_error(row["Error"]):
+                    log(f"[W{worker_id}] WARNED {org_url}")
+                elif row["Error"]:
                     log(f"[W{worker_id}] STILL ERRORED {org_url}")
                 else:
                     log(f"[W{worker_id}] FIXED {org_url}")
@@ -753,7 +944,10 @@ def worker(worker_id, conn):
             else:
                 row = scrape_org(org_url, state, page, worker_id)
                 save_row(conn, row)
-                log(f"[W{worker_id}] SAVED {org_url}")
+                if is_warning_error(row["Error"]):
+                    log(f"[W{worker_id}] SAVED (warning) {org_url}")
+                else:
+                    log(f"[W{worker_id}] SAVED {org_url}")
 
             time.sleep(DELAY)
 
@@ -821,14 +1015,12 @@ def producer(conn, resume=False):
         log(f"========== PRODUCER END STATE {state} ==========")
 
 
-def retry_errors_producer(conn):
-    rows = get_errored_rows(conn)
-
+def retry_rows_producer(conn, rows, label):
     if not rows:
-        log("[RETRY] No errored rows found in database.")
+        log(f"[RETRY] No {label} rows found in database.")
         return
 
-    log(f"\n========== RETRY ERRORED ROWS ({len(rows)}) ==========")
+    log(f"\n========== RETRY {label.upper()} ROWS ({len(rows)}) ==========")
 
     for org_url, state, page, error in rows:
         preview = (error or "")[:80]
@@ -836,6 +1028,14 @@ def retry_errors_producer(conn):
         task_queue.put((state or "", page or 0, org_url, True))
 
     log(f"[RETRY] Queued {len(rows)} orgs for retry")
+
+
+def retry_errors_producer(conn):
+    retry_rows_producer(conn, get_errored_rows(conn), "errored")
+
+
+def retry_warnings_producer(conn):
+    retry_rows_producer(conn, get_warned_rows(conn), "warning")
 
 
 def start_workers(conn):
@@ -877,23 +1077,31 @@ def run_scrape(conn, resume=False):
         stop_workers(threads)
 
 
-def run_retry_errors(conn):
+def run_retry(conn, producer_fn, label):
     threads = start_workers(conn)
 
     try:
-        retry_errors_producer(conn)
-        log("[RETRY DONE] Waiting for worker queue to finish...")
+        producer_fn(conn)
+        log(f"[RETRY DONE] Waiting for worker queue to finish...")
         task_queue.join()
 
         stats = get_db_stats(conn)
         log(
-            f"[RETRY SUMMARY] ok={stats['ok']} "
+            f"[{label} SUMMARY] ok={stats['ok']} warned={stats['warned']} "
             f"errored={stats['errored']} total={stats['total']}"
         )
     except KeyboardInterrupt:
         log("[STOP] KeyboardInterrupt received. Waiting for current tasks to stop.")
     finally:
         stop_workers(threads)
+
+
+def run_retry_errors(conn):
+    run_retry(conn, retry_errors_producer, "RETRY ERRORS")
+
+
+def run_retry_warnings(conn):
+    run_retry(conn, retry_warnings_producer, "RETRY WARNINGS")
 
 
 def main():
@@ -912,12 +1120,15 @@ def main():
             log("[DONE] Scraping finished or safely stopped.")
         elif choice == "3":
             run_retry_errors(conn)
-            log("[DONE] Retry run finished or safely stopped.")
+            log("[DONE] Errored retry run finished or safely stopped.")
         elif choice == "4":
+            run_retry_warnings(conn)
+            log("[DONE] Warning retry run finished or safely stopped.")
+        elif choice == "5":
             print_db_stats(conn)
             input("\nPress Enter to return to menu...")
             continue
-        elif choice == "5":
+        elif choice == "6":
             log("[EXIT] Goodbye.")
             break
 

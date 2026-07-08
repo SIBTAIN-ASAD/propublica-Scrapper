@@ -31,8 +31,19 @@ HEADERS = [
     "Org URL",
     "Filing URL",
     "IRS990 URL",
+    "Status",
     "Error",
 ]
+
+WARNING_PREFIX = "WARNING:"
+
+
+def row_status(error):
+    if not error:
+        return "OK"
+    if str(error).startswith(WARNING_PREFIX):
+        return "WARNING"
+    return "ERROR"
 
 
 def autosize_columns(ws):
@@ -53,7 +64,9 @@ def style_sheet(ws):
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
     light_fill = PatternFill("solid", fgColor="D9EAF7")
+    warning_fill = PatternFill("solid", fgColor="FFF2CC")
     error_fill = PatternFill("solid", fgColor="F4CCCC")
+    status_col = HEADERS.index("Status") + 1
 
     thin_border = Border(
         left=Side(style="thin", color="D9E2F3"),
@@ -72,33 +85,125 @@ def style_sheet(ws):
         cell.border = thin_border
 
     for row in ws.iter_rows(min_row=2):
-        has_error = row[-1].value not in [None, ""]
+        status = row[status_col - 1].value
 
         for cell in row:
             cell.border = thin_border
             cell.alignment = Alignment(vertical="top", wrap_text=True)
 
-            if has_error:
+            if status == "ERROR":
                 cell.fill = error_fill
+            elif status == "WARNING":
+                cell.fill = warning_fill
             elif cell.row % 2 == 0:
                 cell.fill = light_fill
 
     autosize_columns(ws)
 
 
-def create_summary_sheet(wb, state_counts):
+def get_summary_stats(cur):
+    cur.execute("SELECT COUNT(*) FROM results")
+    total = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COUNT(*) FROM results WHERE error IS NULL OR error = ''"
+    )
+    ok_count = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COUNT(*) FROM results WHERE error LIKE ?",
+        (f"{WARNING_PREFIX}%",),
+    )
+    warned_count = cur.fetchone()[0]
+
+    errored_count = total - ok_count - warned_count
+
+    cur.execute("""
+        SELECT
+            state,
+            COUNT(*) AS total,
+            SUM(CASE WHEN error IS NULL OR error = '' THEN 1 ELSE 0 END) AS ok_count,
+            SUM(CASE WHEN error LIKE ? THEN 1 ELSE 0 END) AS warned_count,
+            SUM(
+                CASE
+                    WHEN error IS NOT NULL
+                     AND error != ''
+                     AND error NOT LIKE ?
+                    THEN 1 ELSE 0
+                END
+            ) AS errored_count
+        FROM results
+        GROUP BY state
+        ORDER BY state
+    """, (f"{WARNING_PREFIX}%", f"{WARNING_PREFIX}%"))
+
+    per_state = {
+        row[0]: {
+            "total": row[1],
+            "ok": row[2],
+            "warned": row[3],
+            "errored": row[4],
+        }
+        for row in cur.fetchall()
+    }
+
+    return {
+        "total": total,
+        "ok": ok_count,
+        "warned": warned_count,
+        "errored": errored_count,
+        "per_state": per_state,
+    }
+
+
+def create_summary_sheet(wb, summary_stats):
     ws = wb.create_sheet("Summary", 0)
 
-    ws.append(["State", "Total Records"])
-    for state, count in state_counts.items():
-        ws.append([state, count])
+    ws.append(["Metric", "Count"])
+    ws.append(["Total records", summary_stats["total"]])
+    ws.append(["Successful (OK)", summary_stats["ok"]])
+    ws.append(["Warnings", summary_stats["warned"]])
+    ws.append(["Errors", summary_stats["errored"]])
+    ws.append([])
 
-    ws["A1"].fill = PatternFill("solid", fgColor="7030A0")
-    ws["B1"].fill = PatternFill("solid", fgColor="7030A0")
-    ws["A1"].font = Font(color="FFFFFF", bold=True)
-    ws["B1"].font = Font(color="FFFFFF", bold=True)
+    ws.append(["State", "Total", "OK", "Warnings", "Errors"])
+    for state in STATES:
+        counts = summary_stats["per_state"].get(state, {
+            "total": 0,
+            "ok": 0,
+            "warned": 0,
+            "errored": 0,
+        })
+        ws.append([
+            state,
+            counts["total"],
+            counts["ok"],
+            counts["warned"],
+            counts["errored"],
+        ])
 
-    for row in ws.iter_rows():
+    header_fill = PatternFill("solid", fgColor="7030A0")
+    header_font = Font(color="FFFFFF", bold=True)
+    warning_fill = PatternFill("solid", fgColor="FFF2CC")
+    error_fill = PatternFill("solid", fgColor="F4CCCC")
+    error_font = Font(color="9C0006")
+
+    for cell in ws["A1:B1"][0]:
+        cell.fill = header_fill
+        cell.font = header_font
+
+    state_header_row = 8
+    for cell in ws[state_header_row]:
+        cell.fill = header_fill
+        cell.font = header_font
+
+    for row in ws.iter_rows(min_row=state_header_row + 1):
+        if not row[0].value:
+            continue
+
+        warnings = row[3].value or 0
+        errors = row[4].value or 0
+
         for cell in row:
             cell.alignment = Alignment(horizontal="center")
             cell.border = Border(
@@ -107,6 +212,12 @@ def create_summary_sheet(wb, state_counts):
                 top=Side(style="thin", color="D9E2F3"),
                 bottom=Side(style="thin", color="D9E2F3"),
             )
+
+        if warnings:
+            row[3].fill = warning_fill
+        if errors:
+            row[4].fill = error_fill
+            row[4].font = error_font
 
     ws.freeze_panes = "A2"
     autosize_columns(ws)
@@ -118,12 +229,11 @@ def export_to_excel():
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+    summary_stats = get_summary_stats(cur)
 
     wb = Workbook()
     default_sheet = wb.active
     wb.remove(default_sheet)
-
-    state_counts = {}
 
     for state in STATES:
         print(f"[EXPORT] Creating sheet for {state}")
@@ -151,10 +261,10 @@ def export_to_excel():
         """, (state,))
 
         rows = cur.fetchall()
-        state_counts[state] = len(rows)
 
         for row in rows:
-            ws.append(row)
+            error = row[-1]
+            ws.append([*row[:-1], row_status(error), error])
 
         if rows:
             table_ref = f"A1:{get_column_letter(len(HEADERS))}{len(rows) + 1}"
@@ -173,15 +283,25 @@ def export_to_excel():
 
         style_sheet(ws)
 
-        print(f"[DONE] {state}: {len(rows)} rows")
+        counts = summary_stats["per_state"].get(state, {"total": 0, "ok": 0, "warned": 0, "errored": 0})
+        print(
+            f"[DONE] {state}: {counts['total']} rows "
+            f"(ok={counts['ok']} warned={counts['warned']} errored={counts['errored']})"
+        )
 
-    create_summary_sheet(wb, state_counts)
+    create_summary_sheet(wb, summary_stats)
 
     wb.save(EXCEL_PATH)
     conn.close()
 
     print(f"\n[SAVED] Excel exported successfully:")
     print(EXCEL_PATH)
+    print(
+        f"[SUMMARY] total={summary_stats['total']} "
+        f"ok={summary_stats['ok']} "
+        f"warned={summary_stats['warned']} "
+        f"errored={summary_stats['errored']}"
+    )
 
 
 if __name__ == "__main__":
