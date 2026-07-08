@@ -286,6 +286,91 @@ def save_row(conn, row):
         conn.commit()
 
 
+def get_db_stats(conn):
+    with db_lock:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM results")
+        total = cur.fetchone()[0]
+        cur.execute(
+            "SELECT COUNT(*) FROM results WHERE error IS NULL OR error = ''"
+        )
+        ok_count = cur.fetchone()[0]
+
+    return {
+        "total": total,
+        "ok": ok_count,
+        "errored": total - ok_count,
+    }
+
+
+def get_errored_rows(conn):
+    with db_lock:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT org_url, state, page, error
+            FROM results
+            WHERE error IS NOT NULL AND error != ''
+            ORDER BY state, page, org_url
+        """)
+        return cur.fetchall()
+
+
+def print_db_stats(conn):
+    stats = get_db_stats(conn)
+    checkpoint = load_checkpoint()
+
+    log("\n=== Database Stats ===")
+    log(f"Total rows:    {stats['total']}")
+    log(f"Successful:    {stats['ok']}")
+    log(f"Errored:       {stats['errored']}")
+
+    if checkpoint:
+        log(
+            f"Checkpoint:    state={checkpoint['state']} "
+            f"page={checkpoint['page']}"
+        )
+    else:
+        log("Checkpoint:    none")
+
+    if stats["errored"]:
+        log("\nRecent errors:")
+        for org_url, state, page, error in get_errored_rows(conn)[:5]:
+            preview = (error or "")[:100]
+            log(f"  - {org_url} [{state} p{page}]: {preview}")
+        if stats["errored"] > 5:
+            log(f"  ... and {stats['errored'] - 5} more")
+
+
+def show_start_menu(conn):
+    stats = get_db_stats(conn)
+    checkpoint = load_checkpoint()
+
+    print("\n=== ProPublica Scraper ===")
+    print(f"Database: {DB_PATH}")
+    print(
+        f"Rows: {stats['total']} total | "
+        f"{stats['ok']} ok | {stats['errored']} errored"
+    )
+    if checkpoint:
+        print(
+            f"Checkpoint: state={checkpoint['state']} "
+            f"page={checkpoint['page']}"
+        )
+    print()
+    print("1. Fresh start (scrape from beginning)")
+    print("2. Resume from checkpoint")
+    print("3. Retry all errored rows in database")
+    print("4. Show database stats")
+    print("5. Exit")
+    print()
+
+    while True:
+        choice = input("Select option [1-5]: ").strip()
+        if choice in {"1", "2", "3", "4", "5"}:
+            return choice
+        print("Invalid choice. Enter 1, 2, 3, 4, or 5.")
+
+
 def save_checkpoint(state, page):
     with db_lock:
         CHECKPOINT_PATH.write_text(
@@ -648,10 +733,22 @@ def worker(worker_id, conn):
             task_queue.task_done()
             break
 
-        state, page, org_url = item
+        if len(item) == 4:
+            state, page, org_url, force_retry = item
+        else:
+            state, page, org_url = item
+            force_retry = False
 
         try:
-            if already_scraped(conn, org_url):
+            if force_retry:
+                log(f"[W{worker_id}] RETRY {org_url}")
+                row = scrape_org(org_url, state, page, worker_id)
+                save_row(conn, row)
+                if row["Error"]:
+                    log(f"[W{worker_id}] STILL ERRORED {org_url}")
+                else:
+                    log(f"[W{worker_id}] FIXED {org_url}")
+            elif already_scraped(conn, org_url):
                 log(f"[W{worker_id}] SKIP already scraped {org_url}")
             else:
                 row = scrape_org(org_url, state, page, worker_id)
@@ -724,12 +821,24 @@ def producer(conn, resume=False):
         log(f"========== PRODUCER END STATE {state} ==========")
 
 
-def main():
-    resume_input = input("Resume from last checkpoint? y/n: ").strip().lower()
-    resume = resume_input == "y"
+def retry_errors_producer(conn):
+    rows = get_errored_rows(conn)
 
-    conn = init_db()
+    if not rows:
+        log("[RETRY] No errored rows found in database.")
+        return
 
+    log(f"\n========== RETRY ERRORED ROWS ({len(rows)}) ==========")
+
+    for org_url, state, page, error in rows:
+        preview = (error or "")[:80]
+        log(f"[RETRY QUEUE] {org_url} | previous: {preview}")
+        task_queue.put((state or "", page or 0, org_url, True))
+
+    log(f"[RETRY] Queued {len(rows)} orgs for retry")
+
+
+def start_workers(conn):
     threads = []
 
     log(f"[START] Workers={WORKERS}")
@@ -739,30 +848,80 @@ def main():
         t = threading.Thread(
             target=worker,
             args=(i + 1, conn),
-            daemon=True
+            daemon=True,
         )
         t.start()
         threads.append(t)
 
+    return threads
+
+
+def stop_workers(threads):
+    for _ in threads:
+        task_queue.put(None)
+
+    for t in threads:
+        t.join()
+
+
+def run_scrape(conn, resume=False):
+    threads = start_workers(conn)
+
     try:
         producer(conn, resume=resume)
-
         log("[PRODUCER DONE] Waiting for worker queue to finish...")
         task_queue.join()
-
     except KeyboardInterrupt:
         log("[STOP] KeyboardInterrupt received. Waiting for current tasks to stop.")
-
     finally:
-        for _ in threads:
-            task_queue.put(None)
+        stop_workers(threads)
 
-        for t in threads:
-            t.join()
 
-        conn.close()
+def run_retry_errors(conn):
+    threads = start_workers(conn)
 
-        log("[DONE] Scraping finished or safely stopped.")
+    try:
+        retry_errors_producer(conn)
+        log("[RETRY DONE] Waiting for worker queue to finish...")
+        task_queue.join()
+
+        stats = get_db_stats(conn)
+        log(
+            f"[RETRY SUMMARY] ok={stats['ok']} "
+            f"errored={stats['errored']} total={stats['total']}"
+        )
+    except KeyboardInterrupt:
+        log("[STOP] KeyboardInterrupt received. Waiting for current tasks to stop.")
+    finally:
+        stop_workers(threads)
+
+
+def main():
+    conn = init_db()
+
+    while True:
+        choice = show_start_menu(conn)
+
+        if choice == "1":
+            run_scrape(conn, resume=False)
+            log("[DONE] Scraping finished or safely stopped.")
+        elif choice == "2":
+            if not load_checkpoint():
+                log("[WARN] No checkpoint found. Starting fresh instead.")
+            run_scrape(conn, resume=True)
+            log("[DONE] Scraping finished or safely stopped.")
+        elif choice == "3":
+            run_retry_errors(conn)
+            log("[DONE] Retry run finished or safely stopped.")
+        elif choice == "4":
+            print_db_stats(conn)
+            input("\nPress Enter to return to menu...")
+            continue
+        elif choice == "5":
+            log("[EXIT] Goodbye.")
+            break
+
+    conn.close()
 
 
 if __name__ == "__main__":
